@@ -1,0 +1,30 @@
+# Auth and environment secrets
+.env
+credentials.json
+client_secret_*.json
+token.pickle
+token*.json
+
+# Database files
+*.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data
+data/
