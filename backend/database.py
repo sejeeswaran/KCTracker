@@ -115,45 +115,83 @@ def create_user_ledger(username):
 
 def _migrate_add_columns(cursor):
     """Migrate legacy schema to current schema.
-
-    Handles:
-    - Old tables with 'time' NOT NULL column (blocks inserts)
-    - Missing 'balance' or 'name' columns
+    Adds missing columns and recreates the table if the UNIQUE constraint
+    needs to include source_bank.
     """
-    cursor.execute("PRAGMA table_info(transactions)")
-    cols = {row[1]: row for row in cursor.fetchall()}
-
-    # If legacy 'time' column exists (NOT NULL), we must recreate the table
-    if "time" in cols:
-        # Backup existing data
-        cursor.execute("SELECT date, name, description, debit, credit, balance, created_at FROM transactions")
-        existing = cursor.fetchall()
-
-        cursor.execute("DROP TABLE transactions")
-        cursor.execute("""
-            CREATE TABLE transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                name TEXT,
-                description TEXT NOT NULL DEFAULT '',
-                debit REAL DEFAULT 0,
-                credit REAL DEFAULT 0,
-                balance REAL,
-                created_at TEXT NOT NULL,
-                UNIQUE(date, description, debit, credit, balance)
-            )
-        """)
-        cursor.execute(CREATE_INDEX_DATE_SQL)
-
-        # Restore data
-        for row in existing:
-            cursor.execute(
-                "INSERT OR IGNORE INTO transactions (date, name, description, debit, credit, balance, created_at) VALUES (?,?,?,?,?,?,?)",
-                row
-            )
+    cols = _get_existing_columns(cursor)
+    if not cols:
         return
 
-    # Standard migrations for missing columns
+    if _needs_unique_constraint_migration(cursor):
+        _recreate_transactions_table(cursor, cols)
+        return
+
+    _add_missing_columns(cursor, cols)
+
+
+def _get_existing_columns(cursor):
+    """Get the set of existing columns in the transactions table."""
+    try:
+        cursor.execute("PRAGMA table_info(transactions)")
+        return {row[1] for row in cursor.fetchall()}
+    except Exception:
+        return set()
+
+
+def _needs_unique_constraint_migration(cursor):
+    """Check if the table was created without source_bank in the UNIQUE constraint."""
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'")
+    create_sql_row = cursor.fetchone()
+    return create_sql_row and "source_bank" not in create_sql_row[0]
+
+
+def _recreate_transactions_table(cursor, cols):
+    """Recreate the transactions table to update the UNIQUE constraint."""
+    # Ensure all columns exist before migrating
+    for col, coltype in [
+        ("balance", "REAL"),
+        ("name", "TEXT"),
+        ("user_description", "TEXT DEFAULT ''"),
+        ("source_bank", "TEXT DEFAULT ''"),
+    ]:
+        if col not in cols:
+            try:
+                cursor.execute(f"ALTER TABLE transactions ADD COLUMN {col} {coltype}")
+            except Exception:
+                pass
+
+    # Recreate table with new unique constraint including source_bank
+    cursor.execute("SELECT id, date, name, description, user_description, debit, credit, balance, source_bank, created_at FROM transactions")
+    existing = cursor.fetchall()
+    cursor.execute("DROP TABLE transactions")
+    cursor.execute("""
+        CREATE TABLE transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            name TEXT,
+            description TEXT NOT NULL DEFAULT '',
+            user_description TEXT DEFAULT '',
+            debit REAL DEFAULT 0,
+            credit REAL DEFAULT 0,
+            balance REAL,
+            source_bank TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE(date, description, debit, credit, balance, source_bank)
+        )
+    """)
+    cursor.execute(CREATE_INDEX_DATE_SQL)
+    for row in existing:
+        try:
+            cursor.execute(
+                "INSERT OR IGNORE INTO transactions (id, date, name, description, user_description, debit, credit, balance, source_bank, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                row
+            )
+        except Exception:
+            pass
+
+
+def _add_missing_columns(cursor, cols):
+    """Add standard missing columns to the transactions table."""
     if "balance" not in cols:
         cursor.execute("ALTER TABLE transactions ADD COLUMN balance REAL")
     if "name" not in cols:
@@ -162,40 +200,6 @@ def _migrate_add_columns(cursor):
         cursor.execute("ALTER TABLE transactions ADD COLUMN user_description TEXT DEFAULT ''")
     if "source_bank" not in cols:
         cursor.execute("ALTER TABLE transactions ADD COLUMN source_bank TEXT DEFAULT ''")
-
-    # Migrate UNIQUE constraint to include source_bank
-    # Check if the old constraint (without source_bank) needs upgrading
-    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='transactions'")
-    create_sql = cursor.fetchone()
-    if create_sql and "source_bank" not in create_sql[0]:
-        # Recreate table with new unique constraint
-        cursor.execute("SELECT id, date, name, description, user_description, debit, credit, balance, source_bank, created_at FROM transactions")
-        existing = cursor.fetchall()
-        cursor.execute("DROP TABLE transactions")
-        cursor.execute("""
-            CREATE TABLE transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                name TEXT,
-                description TEXT NOT NULL DEFAULT '',
-                user_description TEXT DEFAULT '',
-                debit REAL DEFAULT 0,
-                credit REAL DEFAULT 0,
-                balance REAL,
-                source_bank TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                UNIQUE(date, description, debit, credit, balance, source_bank)
-            )
-        """)
-        cursor.execute(CREATE_INDEX_DATE_SQL)
-        for row in existing:
-            try:
-                cursor.execute(
-                    "INSERT OR IGNORE INTO transactions (id, date, name, description, user_description, debit, credit, balance, source_bank, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    row
-                )
-            except Exception:
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -508,20 +512,22 @@ def get_bank_balances_over_time(username):
 
     Tries 3 strategies in order:
     1. transactions.balance per bank (ideal — real parsed closing balances)
+       FIX: removed `AND balance != 0` — zero is a valid closing balance.
     2. daily_summary.closing_balance (single "Account" line)
-    3. Computed running balance from debit/credit totals per date
+    3. Computed running balance from cumulative debit/credit per date
     """
     conn = connect_user_db(username)
     cursor = conn.cursor()
 
     # ── Strategy 1: real balance column per transaction ──────────────────────
+    # NOTE: Only filter NULL — do NOT filter balance = 0 (zero is a valid balance)
     try:
         cursor.execute("""
             SELECT date,
                    COALESCE(NULLIF(TRIM(source_bank),''), 'Unknown') as bank,
                    balance
             FROM transactions
-            WHERE balance IS NOT NULL AND balance != 0
+            WHERE balance IS NOT NULL
             ORDER BY date ASC, id ASC
         """)
         rows = cursor.fetchall()
@@ -530,6 +536,7 @@ def get_bank_balances_over_time(username):
 
     if rows:
         conn.close()
+        # Keep only the LAST balance per (date, bank) combination
         seen = {}
         for row in rows:
             key = (row[0], row[1])
@@ -543,7 +550,7 @@ def get_bank_balances_over_time(username):
         cursor.execute("""
             SELECT date, closing_balance
             FROM daily_summary
-            WHERE closing_balance IS NOT NULL AND closing_balance != 0
+            WHERE closing_balance IS NOT NULL
             ORDER BY date ASC
         """)
         summary_rows = cursor.fetchall()
@@ -555,7 +562,7 @@ def get_bank_balances_over_time(username):
         return [{"date": r[0], "bank": "Account", "balance": float(r[1])}
                 for r in summary_rows]
 
-    # ── Strategy 3: compute running balance from debit/credit per date ────────
+    # ── Strategy 3: compute cumulative running balance from debit/credit ──────
     try:
         cursor.execute("""
             SELECT date,
@@ -573,7 +580,7 @@ def get_bank_balances_over_time(username):
     if not net_rows:
         return []
 
-    # Build cumulative running balance
+    # Build cumulative running balance across all dates
     running = 0.0
     result = []
     for row in net_rows:
