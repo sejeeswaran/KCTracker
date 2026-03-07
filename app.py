@@ -32,6 +32,7 @@ from backend.database import (
     get_bank_credential,
     get_all_bank_credentials,
     delete_bank_credential,
+    rebuild_daily_summary,
 )
 from backend.security import encrypt_password as encrypt_bank_pw, decrypt_password as decrypt_bank_pw
 from backend.parser import parse_statement, allowed_file, group_transactions_for_ledger
@@ -871,8 +872,40 @@ def api_chart_data():
 @app.route("/api/bank-balances")
 @login_required
 def api_bank_balances():
-    data = get_bank_balances_over_time(session["username"])
+    username = session["username"]
+    # Auto-rebuild daily_summary if stale, then fetch
+    rebuild_daily_summary(username)
+    data = get_bank_balances_over_time(username)
     return jsonify(data)
+
+
+@app.route("/api/debug-bank")
+@login_required
+def debug_bank():
+    """Debug: shows raw balance data and daily_summary to diagnose bank chart issues."""
+    from backend.database import connect_user_db
+    conn = connect_user_db(session["username"])
+    cur = conn.cursor()
+    # Sample of transactions with balance info
+    cur.execute("""
+        SELECT date, source_bank, balance, debit, credit
+        FROM transactions
+        ORDER BY date DESC
+        LIMIT 30
+    """)
+    txns = [dict(r) for r in cur.fetchall()]
+    # daily_summary
+    cur.execute("SELECT * FROM daily_summary ORDER BY date DESC LIMIT 30")
+    summary = [dict(r) for r in cur.fetchall()]
+    # counts
+    cur.execute("SELECT COUNT(*) as total, SUM(CASE WHEN balance IS NOT NULL THEN 1 ELSE 0 END) as with_balance FROM transactions")
+    counts = dict(cur.fetchone())
+    conn.close()
+    return jsonify({
+        "counts": counts,
+        "transactions_sample": txns,
+        "daily_summary_sample": summary
+    })
 
 
 # ---------------------------------------------------------------------------

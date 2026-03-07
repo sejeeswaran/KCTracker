@@ -486,36 +486,99 @@ def get_all_dates_summary(username):
 # ---------------------------------------------------------------------------
 # Merchant Alias CRUD (Auto-learning name system)
 # ---------------------------------------------------------------------------
+def rebuild_daily_summary(username):
+    """
+    Recompute and upsert daily_summary for ALL dates in transactions.
+    Call this if daily_summary is out of sync or empty.
+    """
+    conn = connect_user_db(username)
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT date FROM transactions ORDER BY date ASC")
+    dates = [row[0] for row in cursor.fetchall()]
+    for d in dates:
+        _update_daily_summary(cursor, d)
+    conn.commit()
+    conn.close()
+
+
 def get_bank_balances_over_time(username):
     """
     Return per-bank closing balance for every date that has transactions.
     Result: [ {date, bank, balance}, ... ] ordered by date ASC.
+
+    Tries 3 strategies in order:
+    1. transactions.balance per bank (ideal — real parsed closing balances)
+    2. daily_summary.closing_balance (single "Account" line)
+    3. Computed running balance from debit/credit totals per date
     """
     conn = connect_user_db(username)
     cursor = conn.cursor()
+
+    # ── Strategy 1: real balance column per transaction ──────────────────────
     try:
         cursor.execute("""
             SELECT date,
                    COALESCE(NULLIF(TRIM(source_bank),''), 'Unknown') as bank,
                    balance
             FROM transactions
-            WHERE balance IS NOT NULL
+            WHERE balance IS NOT NULL AND balance != 0
             ORDER BY date ASC, id ASC
         """)
         rows = cursor.fetchall()
     except Exception:
         rows = []
-    finally:
+
+    if rows:
         conn.close()
+        seen = {}
+        for row in rows:
+            key = (row[0], row[1])
+            seen[key] = float(row[2])
+        result = [{"date": k[0], "bank": k[1], "balance": v} for k, v in seen.items()]
+        result.sort(key=lambda x: x["date"])
+        return result
 
-    # For each (date, bank) keep only the last balance (highest id = last row)
-    seen = {}
-    for row in rows:
-        key = (row[0], row[1])
-        seen[key] = float(row[2])
+    # ── Strategy 2: daily_summary.closing_balance ─────────────────────────────
+    try:
+        cursor.execute("""
+            SELECT date, closing_balance
+            FROM daily_summary
+            WHERE closing_balance IS NOT NULL AND closing_balance != 0
+            ORDER BY date ASC
+        """)
+        summary_rows = cursor.fetchall()
+    except Exception:
+        summary_rows = []
 
-    result = [{"date": k[0], "bank": k[1], "balance": v} for k, v in seen.items()]
-    result.sort(key=lambda x: x["date"])
+    if summary_rows:
+        conn.close()
+        return [{"date": r[0], "bank": "Account", "balance": float(r[1])}
+                for r in summary_rows]
+
+    # ── Strategy 3: compute running balance from debit/credit per date ────────
+    try:
+        cursor.execute("""
+            SELECT date,
+                   COALESCE(SUM(credit), 0) - COALESCE(SUM(debit), 0) as net
+            FROM transactions
+            GROUP BY date
+            ORDER BY date ASC
+        """)
+        net_rows = cursor.fetchall()
+    except Exception:
+        net_rows = []
+
+    conn.close()
+
+    if not net_rows:
+        return []
+
+    # Build cumulative running balance
+    running = 0.0
+    result = []
+    for row in net_rows:
+        running += float(row[1])
+        result.append({"date": row[0], "bank": "Account", "balance": running})
     return result
 
 
