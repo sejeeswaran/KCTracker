@@ -497,7 +497,7 @@
         Chart.defaults.color = '#6b7280';
 
         fetch('/api/chart-data')
-            .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+            .then(r => { if (!r.ok) { throw new Error('API request failed'); } return r.json(); })
             .then(data => {
                 allData = data;
                 updateSummaryStrip(data);
@@ -507,7 +507,7 @@
             .catch(() => showNoData('chartLine', 'loadingLine'));
 
         fetch('/api/bank-balances')
-            .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+            .then(r => { if (!r.ok) { throw new Error('API request failed'); } return r.json(); })
             .then(data => {
                 allBankData = data;
                 buildBankMonthDropdown(data);
