@@ -41,15 +41,18 @@ def _process_date_group(date, group_rows):
                                 "description": row["description"], "amount": row["credit"]})
             total_credit += row["credit"]
             credit_sno += 1
-    last_balance = group_rows[-1].get("balance")
-    closing_balance = last_balance if last_balance is not None else (total_credit - total_debit)
-
-    # Per-bank closing balances
-    bank_last = {}
+    # Per-bank closing balances — use MAX(id) per bank, not last row in list
+    bank_max = {}  # bank -> (max_id, balance)
     for row in group_rows:
-        if row.get("balance") is not None:
-            bank = (row.get("source_bank") or "").strip() or "Unknown"
-            bank_last[bank] = float(row["balance"])
+        if row.get("balance") is None:
+            continue
+        bank = (row.get("source_bank") or "").strip() or "Unknown"
+        row_id = row.get("id", 0)
+        if bank not in bank_max or row_id > bank_max[bank][0]:
+            bank_max[bank] = (row_id, float(row["balance"]))
+
+    bank_last = {bank: v[1] for bank, v in bank_max.items()}
+    closing_balance = sum(v[1] for v in bank_max.values()) if bank_max else (total_credit - total_debit)
 
     return {"date": date, "debit": debit_list, "credit": credit_list,
             "total_debit": total_debit, "total_credit": total_credit,

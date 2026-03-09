@@ -343,7 +343,9 @@ def insert_transactions_bulk(username, transactions, source_bank=""):
 def _get_per_bank_balances(cursor, date):
     """
     Return {bank_name: closing_balance} for DISPLAY split only.
-    closing_balance per bank = last transaction balance value for that bank on that date.
+    Uses MAX(id) per bank to get the true end-of-day closing balance,
+    regardless of insertion order (works for all banks — IOB newest-first,
+    HDFC oldest-first, etc.).
     Returns {} if only one bank (caller shows normal single balance bar).
     Returns {bank_A: x, bank_B: y} if 2+ banks exist on that date.
     """
@@ -354,22 +356,28 @@ def _get_per_bank_balances(cursor, date):
         cursor.execute("ALTER TABLE transactions ADD COLUMN source_bank TEXT DEFAULT ''")
         cursor.connection.commit()
 
+    # MAX(id) per bank = last inserted row per bank = true closing balance
+    # regardless of what order the bank PDF was printed in
     cursor.execute("""
-        SELECT COALESCE(source_bank, '') as bank, balance
-        FROM transactions
-        WHERE date = ? AND balance IS NOT NULL
-        ORDER BY id ASC
-    """, (date,))
+        SELECT COALESCE(NULLIF(TRIM(t.source_bank), ''), 'Unknown') as bank,
+               t.balance
+        FROM transactions t
+        INNER JOIN (
+            SELECT COALESCE(NULLIF(TRIM(source_bank), ''), 'Unknown') as bank,
+                   MAX(id) as max_id
+            FROM transactions
+            WHERE date = ? AND balance IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(source_bank), ''), 'Unknown')
+        ) last ON COALESCE(NULLIF(TRIM(t.source_bank), ''), 'Unknown') = last.bank
+               AND t.id = last.max_id
+        WHERE t.date = ?
+    """, (date, date))
+
     rows = cursor.fetchall()
     if not rows:
         return {}
 
-    bank_last = {}
-    for row in rows:
-        bank = row[0].strip() if row[0] and row[0].strip() else "Unknown"
-        bank_last[bank] = float(row[1])  # last one per bank wins
-
-    return bank_last
+    return {row[0]: float(row[1]) for row in rows}
 
 
 def _update_daily_summary(cursor, date):
@@ -382,11 +390,17 @@ def _update_daily_summary(cursor, date):
     """, (date,))
     total_debit, total_credit, count = cursor.fetchone()
 
-    # Closing balance = last transaction's balance for this date
+    # Closing balance = sum of each bank's MAX(id) balance for this date
+    # MAX(id) per bank = true end-of-day balance regardless of insertion order
     cursor.execute("""
-        SELECT balance FROM transactions
-        WHERE date = ? AND balance IS NOT NULL
-        ORDER BY id DESC LIMIT 1
+        SELECT COALESCE(SUM(b.balance), NULL)
+        FROM (
+            SELECT MAX(id) as max_id
+            FROM transactions
+            WHERE date = ? AND balance IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(source_bank), ''), 'Unknown')
+        ) last
+        JOIN transactions b ON b.id = last.max_id
     """, (date,))
     row = cursor.fetchone()
     closing = row[0] if row else None
@@ -508,13 +522,19 @@ def get_summary_by_date(username, date):
     # Per-bank balances (display split only — does NOT affect closing_balance)
     bank_balances = _get_per_bank_balances(cursor, date)
 
-    # Closing balance = last transaction's balance field from the bank statement
-    cursor.execute(
-        "SELECT balance FROM transactions WHERE date = ? AND balance IS NOT NULL ORDER BY id DESC LIMIT 1",
-        (date,),
-    )
+    # Closing balance = sum of each bank's MAX(id) balance for this date
+    cursor.execute("""
+        SELECT COALESCE(SUM(b.balance), NULL)
+        FROM (
+            SELECT MAX(id) as max_id
+            FROM transactions
+            WHERE date = ? AND balance IS NOT NULL
+            GROUP BY COALESCE(NULLIF(TRIM(source_bank), ''), 'Unknown')
+        ) last
+        JOIN transactions b ON b.id = last.max_id
+    """, (date,))
     bal_row = cursor.fetchone()
-    closing_balance = float(bal_row[0]) if bal_row else (total_credit - total_debit)
+    closing_balance = float(bal_row[0]) if bal_row and bal_row[0] is not None else (total_credit - total_debit)
 
     conn.close()
     return {
