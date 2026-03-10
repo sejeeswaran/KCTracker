@@ -630,12 +630,12 @@ def change_password():
 
 
 # ---------------------------------------------------------------------------
-# Charts
+# Analytics
 # ---------------------------------------------------------------------------
-@app.route("/charts")
+@app.route("/analytics")
 @login_required
-def charts():
-    return render_template("charts.html", username=session["username"])
+def analytics():
+    return render_template("analytics.html", username=session["username"])
 
 
 @app.route("/api/chart-data")
@@ -753,12 +753,38 @@ def _resolve_period_dates(period):
         return (today - timedelta(days=180)).isoformat(), today.isoformat()
     if period == "this_year":
         return today.replace(month=1, day=1).isoformat(), today.isoformat()
+    if period == "fy_current":
+        # Indian financial year: Apr 1 – Mar 31
+        fy_start_year = today.year if today.month >= 4 else today.year - 1
+        return date(fy_start_year, 4, 1).isoformat(), today.isoformat()
+    if period == "fy_previous":
+        fy_start_year = (today.year if today.month >= 4 else today.year - 1) - 1
+        return date(fy_start_year, 4, 1).isoformat(), date(fy_start_year + 1, 3, 31).isoformat()
+    if period == "recent_30":
+        return (today - timedelta(days=30)).isoformat(), today.isoformat()
+    if period and period.startswith("month_"):
+        ym = period[6:]  # strip "month_" → "2026-02"
+        try:
+            y, m = int(ym[:4]), int(ym[5:7])
+            last_day = _cal.monthrange(y, m)[1]
+            return date(y, m, 1).isoformat(), date(y, m, last_day).isoformat()
+        except (ValueError, IndexError):
+            pass
     return None, None
 
 
 def _build_month_options(all_dates):
+    from datetime import datetime
     months = sorted({d["date"][:7] for d in all_dates}, reverse=True)
-    return months
+    result = []
+    for ym in months:
+        try:
+            dt = datetime.strptime(ym, "%Y-%m")
+            label = dt.strftime("%b %Y")   # e.g. "Feb 2026"
+        except ValueError:
+            label = ym
+        result.append({"value": f"month_{ym}", "label": label})
+    return result
 
 
 def _handle_statement_post(username, latest_balance, latest_date_str, month_options):
