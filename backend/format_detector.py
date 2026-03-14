@@ -22,6 +22,8 @@ _BALANCE_KEYWORDS = {"balance", "closing balance", "available balance", "bal", "
 _DATE_KEYWORDS = {"date", "txn date", "transaction date", "value date", "posting date"}
 _DESC_KEYWORDS = {"description", "narration", "particulars", "details", "transaction details"}
 
+_DEFAULT_DATE_FORMAT = "DD/MM/YYYY"
+
 
 def detect_format(raw_rows, headers=None):
     """
@@ -39,7 +41,7 @@ def detect_format(raw_rows, headers=None):
     config = {
         "mode": "dual_column",
         "has_balance": False,
-        "date_format": "DD/MM/YYYY",
+        "date_format": _DEFAULT_DATE_FORMAT,
         "column_count": 0,
         "confidence": 0.5,
     }
@@ -96,9 +98,7 @@ def _detect_from_data(raw_rows, config):
     # Count columns from first few rows
     col_counts = []
     for row in raw_rows[:10]:
-        if isinstance(row, dict):
-            col_counts.append(len(row))
-        elif isinstance(row, (list, tuple)):
+        if isinstance(row, (dict, list, tuple)):
             col_counts.append(len(row))
 
     if col_counts:
@@ -124,6 +124,21 @@ def _detect_from_data(raw_rows, config):
     return config
 
 
+def _extract_numeric_column_values(sample, key):
+    """Extract numeric values for a specific column from a sample of rows."""
+    values = []
+    for row in sample:
+        try:
+            val = str(_get_value(row, key)).replace(",", "").strip()
+            val = re.sub(r"[₹$€£\s]", "", val)
+            val = re.sub(r"\s*(DR|CR|dr|cr)\s*$", "", val)
+            if val:
+                values.append(float(val))
+        except (ValueError, TypeError):
+            continue
+    return values
+
+
 def _detect_balance_column(raw_rows):
     """Check if any column looks like a running balance."""
     if not raw_rows or len(raw_rows) < 3:
@@ -133,16 +148,7 @@ def _detect_balance_column(raw_rows):
     sample = raw_rows[:min(20, len(raw_rows))]
 
     for key in _get_row_keys(sample[0]):
-        values = []
-        for row in sample:
-            try:
-                val = str(_get_value(row, key)).replace(",", "").strip()
-                val = re.sub(r"[₹$€£\s]", "", val)
-                val = re.sub(r"\s*(DR|CR|dr|cr)\s*$", "", val)
-                if val:
-                    values.append(float(val))
-            except (ValueError, TypeError):
-                continue
+        values = _extract_numeric_column_values(sample, key)
 
         if len(values) >= 3:
             # Balance columns typically have large values that change gradually
@@ -163,9 +169,9 @@ def _detect_date_format(raw_rows):
             if match:
                 date_str = match.group()
                 if "/" in date_str:
-                    return "DD/MM/YYYY"
+                    return _DEFAULT_DATE_FORMAT
                 return "DD-MM-YYYY"
-    return "DD/MM/YYYY"
+    return _DEFAULT_DATE_FORMAT
 
 
 def _calculate_confidence(raw_rows, config):
