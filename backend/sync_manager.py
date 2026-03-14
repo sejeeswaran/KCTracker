@@ -85,7 +85,6 @@ def get_or_create_folder(service, folder_name, parent_id=None):
     Find or create a folder in Google Drive.
     Returns the folder ID.
     """
-    # Search for existing folder
     query = f"name = '{folder_name}' and mimeType = '{FOLDER_MIME}' and trashed = false"
     if parent_id:
         query += f" and '{parent_id}' in parents"
@@ -98,7 +97,6 @@ def get_or_create_folder(service, folder_name, parent_id=None):
     if files:
         return files[0]["id"]
 
-    # Create folder
     metadata = {
         "name": folder_name,
         "mimeType": FOLDER_MIME,
@@ -122,7 +120,6 @@ def upload_file(service, local_path, drive_name, folder_id):
     if not os.path.exists(local_path):
         return None
 
-    # Check if file already exists
     query = f"name = '{drive_name}' and '{folder_id}' in parents and trashed = false"
     results = service.files().list(
         q=query, spaces="drive", fields="files(id, name)", pageSize=1
@@ -132,14 +129,12 @@ def upload_file(service, local_path, drive_name, folder_id):
     media = MediaFileUpload(local_path, resumable=True)
 
     if existing:
-        # Update existing file
         file_id = existing[0]["id"]
         updated = service.files().update(
             fileId=file_id, media_body=media
         ).execute()
         return updated["id"]
 
-    # Create new file
     metadata = {
         "name": drive_name,
         "parents": [folder_id],
@@ -159,7 +154,6 @@ def download_file(service, drive_name, local_path, folder_id):
     Overwrites the local file if it exists.
     Returns True on success, False if file not found on Drive.
     """
-    # Find the file in Drive
     query = f"name = '{drive_name}' and '{folder_id}' in parents and trashed = false"
     results = service.files().list(
         q=query, spaces="drive", fields="files(id, name)", pageSize=1
@@ -171,7 +165,6 @@ def download_file(service, drive_name, local_path, folder_id):
 
     file_id = files[0]["id"]
 
-    # Download
     request_obj = service.files().get_media(fileId=file_id)
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, request_obj)
@@ -180,7 +173,6 @@ def download_file(service, drive_name, local_path, folder_id):
     while not done:
         _, done = downloader.next_chunk()
 
-    # Ensure directory exists and write file
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     with open(local_path, "wb") as f:
         f.write(buffer.getvalue())
@@ -257,16 +249,14 @@ def sync_all(username):
         service = authenticate_drive(username)
         root_id, users_id = _get_folder_ids(service)
 
-        # Upload local files to Drive
         if os.path.exists(auth_db):
-            upload_file(service, auth_db,_AUTH_DB_NAME, root_id)
+            upload_file(service, auth_db, _AUTH_DB_NAME, root_id)
             results.append(f"{_AUTH_DB_NAME} uploaded")
 
         if os.path.exists(user_db):
             upload_file(service, user_db, user_db_name, users_id)
             results.append(f"{user_db_name} uploaded")
 
-        # Download latest from Drive (overwrites local)
         download_file(service, _AUTH_DB_NAME, auth_db, root_id)
         results.append(f"{_AUTH_DB_NAME} downloaded")
 
@@ -300,15 +290,11 @@ def sync_download_on_login(username):
         service = authenticate_drive(username)
         root_id, users_id = _get_folder_ids(service)
 
-        # Download auth.db
         download_file(service, _AUTH_DB_NAME, auth_db, root_id)
-
-        # Download user database
         download_file(service, f"{username}.db", user_db, users_id)
 
         return {"success": True, "message": "Data synced from Drive."}
     except Exception as e:
-        # Non-fatal: if Drive is unavailable, continue with local data
         return {"success": False, "message": f"Drive sync skipped: {str(e)}"}
 
 
@@ -326,15 +312,23 @@ def sync_upload_after_change(username):
         service = authenticate_drive(username)
         root_id, users_id = _get_folder_ids(service)
 
-        # Upload auth.db
         if os.path.exists(auth_db):
             upload_file(service, auth_db, _AUTH_DB_NAME, root_id)
 
-        # Upload user database
         if os.path.exists(user_db):
             upload_file(service, user_db, f"{username}.db", users_id)
 
         return {"success": True, "message": "Changes synced to Drive."}
     except Exception as e:
-        # Non-fatal: local changes are preserved
         return {"success": False, "message": f"Drive upload skipped: {str(e)}"}
+
+
+# ---------------------------------------------------------------------------
+# Step 8: Connection check
+# ---------------------------------------------------------------------------
+def is_connected(username):
+    """
+    Check if the user has already linked a Google Drive account.
+    Returns True if a valid token file exists for this user.
+    """
+    return os.path.exists(_user_token_file(username))

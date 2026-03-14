@@ -39,7 +39,8 @@ from backend.parser import parse_statement, allowed_file, group_transactions_for
 from backend.extractor import apply_merchant_aliases
 from backend.ledger import generate_ledger
 from backend.exporter import export_day_ledger, export_range_ledger
-from backend.sync_manager import sync_upload_after_change, sync_download_on_login, sync_all
+from backend.sync_manager import sync_upload_after_change, sync_download_on_login, sync_all, is_connected
+from backend.notifier import notify_drive_request, poll_approvals, is_approved
 
 # Template name constants
 _TPL_REGISTER = "register.html"
@@ -58,6 +59,24 @@ limiter = Limiter(
     default_limits=[],          # No global limit; apply per-route
     storage_uri="memory://",    # In-memory (switch to redis:// for production)
 )
+
+
+# ---------------------------------------------------------------------------
+# Context processor — injects drive status into ALL templates automatically
+# ---------------------------------------------------------------------------
+@app.context_processor
+def inject_drive_status():
+    """Make drive_connected, drive_requested, drive_approved available in all templates."""
+    if "username" in session:
+        username = session["username"]
+        poll_approvals()   # lightweight Telegram poll on each page load
+        return {
+            "drive_connected":  is_connected(username),
+            "drive_requested":  session.get("drive_requested", False),
+            "drive_approved":   is_approved(username),
+        }
+    return {"drive_connected": False, "drive_requested": False, "drive_approved": False}
+
 
 # Initialize on startup
 ensure_directories()
@@ -82,7 +101,7 @@ def login_required(f):
         if "username" not in session:
             flash("Please log in first.", "warning")
             return redirect(url_for("login"))
-        
+
         # Ensure schema is up-to-date for existing sessions
         if not session.get("schema_checked"):
             try:
@@ -131,7 +150,7 @@ def login():
         if success:
             session["username"] = username
             create_user_ledger(username)
-            sync_download_on_login(username)
+            # Drive sync is now manual — removed sync_download_on_login
             flash("Login successful!", "success")
             return redirect(url_for("dashboard"))
         flash(result, "danger")
@@ -179,6 +198,48 @@ def logout():
     session.clear()
     flash("You have been logged out.", "info")
     return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------------------
+# Google Drive — Request Access & Connect routes
+# ---------------------------------------------------------------------------
+@app.route("/request-drive-access", methods=["POST"])
+@login_required
+def request_drive_access():
+    """User submits Gmail to request Drive access — notifies admin via Telegram."""
+    username = session["username"]
+    gmail = request.form.get("gmail", "").strip()
+
+    if not gmail or "@" not in gmail:
+        flash("Please enter a valid Gmail address.", "danger")
+        return redirect(url_for("dashboard"))
+
+    success, _ = notify_drive_request(username, gmail)
+    session["drive_requested"] = True
+    if success:
+        flash("Request sent! You'll be notified here once admin approves your access.", "info")
+    else:
+        flash("Request logged, but admin notification failed. Contact admin directly.", "warning")
+
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/connect-drive")
+@login_required
+def connect_drive():
+    """
+    Triggered after admin approves the user. Runs the Google OAuth flow.
+    On success, token file is saved and button changes to Sync Drive.
+    """
+    username = session["username"]
+    try:
+        from backend.sync_manager import authenticate_drive
+        authenticate_drive(username)
+        session.pop("drive_requested", None)
+        flash("Google Drive connected successfully! Your data will now sync.", "success")
+    except Exception:
+        flash("Connection failed. Make sure admin has approved your access first.", "danger")
+    return redirect(url_for("dashboard"))
 
 
 # ---------------------------------------------------------------------------
@@ -296,48 +357,41 @@ def _get_stmt_password(username, bank_name):
 
 @app.route("/upload", methods=["GET", "POST"])
 @login_required
-@limiter.limit("30 per hour", methods=["POST"])
 def upload():
     username = session["username"]
     saved_banks = get_all_bank_credentials(username)
     bank_names = [b["bank_name"] for b in saved_banks]
 
-    if request.method != "POST":
+    if request.method == "GET":
         return _render_upload(username, bank_names)
 
     file = request.files.get("file")
+    bank_name = request.form.get("bank_name", "").strip()
+
     if not file or file.filename == "":
-        flash("No file selected.", "danger")
+        flash("No file selected.", "warning")
         return _render_upload(username, bank_names)
 
     if not allowed_file(file.filename):
-        flash("File type not allowed. Use CSV, Excel, or PDF.", "danger")
+        flash("Unsupported file type. Please upload a PDF, CSV, or Excel file.", "danger")
         return _render_upload(username, bank_names)
 
-    bank_name = request.form.get("bank_name", "").strip()
-    stmt_password, pw_error = _get_stmt_password(username, bank_name)
-    if pw_error:
-        flash(pw_error, "danger")
+    stmt_password, err = _get_stmt_password(username, bank_name)
+    if err:
+        flash(err, "danger")
         return _render_upload(username, bank_names)
 
-    return _process_upload(file, username, bank_names, stmt_password, bank_name)
-
-
-def _process_upload(file, username, bank_names, stmt_password, bank_name=""):
-    """Save temp file, parse, apply aliases, redirect to preview."""
     temp_path = os.path.join(TEMP_FOLDER, "temp_statement" + os.path.splitext(file.filename)[1])
     file.save(temp_path)
     try:
         result = parse_statement(temp_path, password=stmt_password)
         transactions, detected_bank = result if isinstance(result, tuple) else (result, "")
-        # Auto-detected bank name wins; fall back to user-selected name from form
         resolved_bank = (detected_bank or bank_name).strip()
 
         if not transactions:
             flash("No transactions found in the file.", "warning")
             return _render_upload(username, bank_names)
         transactions = apply_merchant_aliases(transactions, username=username)
-        # Store in temp file (session cookies have 4KB limit)
         preview_path = os.path.join(TEMP_FOLDER, f"{username}_preview.json")
         with open(preview_path, "w", encoding="utf-8") as pf:
             json.dump(transactions, pf)
@@ -363,7 +417,6 @@ def preview():
     if request.method == "POST":
         return _handle_preview_save()
 
-    # GET: show preview
     preview_path = session.get("preview_file", "")
     transactions = []
     if preview_path and os.path.exists(preview_path):
@@ -379,7 +432,6 @@ def preview():
 
 def _handle_preview_save():
     """Handle POST from preview — save transactions to DB."""
-    # Always clean up preview temp file, even if something fails below
     preview_path = session.get("preview_file", "")
 
     def _cleanup_preview():
@@ -419,7 +471,6 @@ def _handle_preview_save():
         import traceback
         traceback.print_exc()
 
-    # Record statement source metadata
     dates = [t.get("date", "") for t in transactions if t.get("date")]
     record_statement_source(
         username,
@@ -429,7 +480,6 @@ def _handle_preview_save():
         end_date=max(dates) if dates else None,
     )
 
-    # Clean up preview temp file (guaranteed)
     session.pop("preview_file", "")
     _cleanup_preview()
 
@@ -444,7 +494,6 @@ def _handle_preview_save():
 @app.route("/api/ledger/<date>")
 @login_required
 def api_ledger(date):
-    """Return daily ledger data as JSON."""
     username = session["username"]
     ledger = generate_ledger(username, date)
     return jsonify(ledger)
@@ -453,7 +502,6 @@ def api_ledger(date):
 @app.route("/api/statement")
 @login_required
 def api_statement():
-    """Return transactions for a date range as JSON."""
     username = session["username"]
     start = request.args.get("start", "")
     end = request.args.get("end", "")
@@ -464,14 +512,14 @@ def api_statement():
 
 
 # ---------------------------------------------------------------------------
-# Add Transaction Manually (from ledger_details page)
+# Add Transaction Manually
 # ---------------------------------------------------------------------------
 @app.route("/api/add-transaction/<date>", methods=["POST"])
 @login_required
 def add_transaction_manual(date):
     username = session["username"]
     data = request.get_json(silent=True) or {}
-    txn_type = data.get("type", "credit")   # "credit" or "debit"
+    txn_type = data.get("type", "credit")
     name = data.get("name", "").strip()
     description = data.get("description", "").strip()
     source_bank = data.get("bank", "").strip()
@@ -482,7 +530,6 @@ def add_transaction_manual(date):
 
     if amount <= 0:
         return jsonify({"success": False, "error": "Amount must be greater than 0"}), 400
-
     if not name:
         return jsonify({"success": False, "error": "Name is required"}), 400
 
@@ -511,12 +558,10 @@ def add_transaction_manual(date):
 def profile():
     username = session["username"]
 
-    # Get total balance from latest date summary
     all_dates = get_all_dates_summary(username)
     total_credit = sum(d.get("total_credit", 0) for d in all_dates)
     total_debit  = sum(d.get("total_debit",  0) for d in all_dates)
 
-    # Latest closing balance — from the most recent date's summary
     latest_balance = 0.0
     latest_date    = None
     if all_dates:
@@ -528,10 +573,8 @@ def profile():
         except Exception:
             latest_balance = total_credit - total_debit
 
-    # Bank passwords list
     banks = get_all_bank_credentials(username)
 
-    # Profile picture path
     profile_img_folder = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "static", "img", "profiles"
     )
@@ -539,7 +582,6 @@ def profile():
     profile_img_file = os.path.join(profile_img_folder, f"{username}.jpg")
     has_profile_img  = os.path.exists(profile_img_file)
 
-    # Get member since from auth db
     from backend.auth import get_auth_db
     conn = get_auth_db()
     cursor = conn.cursor()
@@ -657,7 +699,6 @@ def api_bank_balances():
 @app.route("/api/debug-bank")
 @login_required
 def debug_bank():
-    """Debug: shows raw balance data and daily_summary to diagnose bank chart issues."""
     from backend.database import connect_user_db
     conn = connect_user_db(session["username"])
     cur = conn.cursor()
@@ -705,7 +746,6 @@ def export_range_route(fmt):
 
 
 def _send_and_cleanup(filepath):
-    """Send file as download, then delete the temp export file."""
     from flask import after_this_request
 
     @after_this_request
@@ -739,38 +779,37 @@ def _get_latest_balance_for_statement(username, all_dates):
 
 def _resolve_period_dates(period):
     from datetime import date, timedelta
-    import calendar as _cal
-    today = date.today()
-    if period == "this_month":
-        return today.replace(day=1).isoformat(), today.isoformat()
-    if period == "last_month":
-        first_this = today.replace(day=1)
-        last_prev = first_this - timedelta(days=1)
-        return last_prev.replace(day=1).isoformat(), last_prev.isoformat()
-    if period == "last_3_months":
-        return (today - timedelta(days=90)).isoformat(), today.isoformat()
-    if period == "last_6_months":
-        return (today - timedelta(days=180)).isoformat(), today.isoformat()
-    if period == "this_year":
-        return today.replace(month=1, day=1).isoformat(), today.isoformat()
-    if period == "fy_current":
-        # Indian financial year: Apr 1 – Mar 31
-        fy_start_year = today.year if today.month >= 4 else today.year - 1
-        return date(fy_start_year, 4, 1).isoformat(), today.isoformat()
-    if period == "fy_previous":
-        fy_start_year = (today.year if today.month >= 4 else today.year - 1) - 1
-        return date(fy_start_year, 4, 1).isoformat(), date(fy_start_year + 1, 3, 31).isoformat()
-    if period == "recent_30":
-        return (today - timedelta(days=30)).isoformat(), today.isoformat()
-    if period and period.startswith("month_"):
-        ym = period[6:]  # strip "month_" → "2026-02"
+
+    if not period:
+        return None, None
+
+    if period.startswith("month_"):
+        import calendar as _cal
+        ym = period[6:]
         try:
             y, m = int(ym[:4]), int(ym[5:7])
             last_day = _cal.monthrange(y, m)[1]
             return date(y, m, 1).isoformat(), date(y, m, last_day).isoformat()
         except (ValueError, IndexError):
-            pass
-    return None, None
+            return None, None
+
+    today = date.today()
+    first_this = today.replace(day=1)
+    last_prev = first_this - timedelta(days=1)
+    fy_start_year = today.year if today.month >= 4 else today.year - 1
+
+    periods = {
+        "this_month": (first_this.isoformat(), today.isoformat()),
+        "last_month": (last_prev.replace(day=1).isoformat(), last_prev.isoformat()),
+        "last_3_months": ((today - timedelta(days=90)).isoformat(), today.isoformat()),
+        "last_6_months": ((today - timedelta(days=180)).isoformat(), today.isoformat()),
+        "this_year": (today.replace(month=1, day=1).isoformat(), today.isoformat()),
+        "fy_current": (date(fy_start_year, 4, 1).isoformat(), today.isoformat()),
+        "fy_previous": (date(fy_start_year - 1, 4, 1).isoformat(), date(fy_start_year, 3, 31).isoformat()),
+        "recent_30": ((today - timedelta(days=30)).isoformat(), today.isoformat()),
+    }
+
+    return periods.get(period, (None, None))
 
 
 def _build_month_options(all_dates):
@@ -780,10 +819,10 @@ def _build_month_options(all_dates):
     for ym in months:
         try:
             dt = datetime.strptime(ym, "%Y-%m")
-            label = dt.strftime("%b %Y")   # e.g. "Feb 2026"
-        except ValueError:
-            label = ym
-        result.append({"value": f"month_{ym}", "label": label})
+            label = dt.strftime("%b %Y")
+            result.append({"value": f"month_{ym}", "label": label})
+        except Exception:
+            pass
     return result
 
 
@@ -792,35 +831,11 @@ def _handle_statement_post(username, latest_balance, latest_date_str, month_opti
     start_date = request.form.get("start_date", "").strip()
     end_date = request.form.get("end_date", "").strip()
 
-    if period == "month" and request.form.get("month_select"):
-        ym = request.form.get("month_select", "")
-        if ym:
-            start_date = f"{ym}-01"
-            from datetime import date
-            import calendar as _cal
-            y, m = int(ym[:4]), int(ym[5:7])
-            last_day = _cal.monthrange(y, m)[1]
-            end_date = f"{ym}-{last_day:02d}"
-            period = "month"
-        else:
-            flash("Please select a month.", "warning")
-            return render_template(_TPL_STATEMENT, username=username,
-                                   latest_balance=latest_balance, latest_date=latest_date_str,
-                                   month_options=month_options)
-        grouped = group_transactions_for_ledger(
-            get_transactions_by_range(username, start_date, end_date)
-        )
-        return render_template(_TPL_STATEMENT,
-                               username=username, grouped=grouped,
-                               start_date=start_date, end_date=end_date,
-                               period=period, latest_balance=latest_balance,
-                               latest_date=latest_date_str, month_options=month_options)
-
-    if period != "custom":
+    if period and period != "custom":
         start_date, end_date = _resolve_period_dates(period)
 
     if not start_date or not end_date:
-        flash("Please select both start and end dates.", "danger")
+        flash("Please select a valid period or date range.", "danger")
         return render_template(_TPL_STATEMENT, username=username,
                                latest_balance=latest_balance, latest_date=latest_date_str,
                                month_options=month_options)
@@ -860,7 +875,7 @@ def get_statement():
 
 
 # ---------------------------------------------------------------------------
-# Statement Passwords (legacy route — redirects to settings)
+# Statement Passwords
 # ---------------------------------------------------------------------------
 @app.route("/statement-passwords", methods=["GET", "POST"])
 @login_required
@@ -877,86 +892,28 @@ def statement_passwords():
             add_bank_credential(username, bank_name, encrypted)
             sync_upload_after_change(username)
             flash(f"Password for '{bank_name}' saved successfully.", "success")
-        return redirect(url_for("statement_passwords"))
 
-    banks = get_all_bank_credentials(username)
-    return render_template(_TPL_SETTINGS, username=username, banks=banks)
-
-
-# ---------------------------------------------------------------------------
-# Delete / Update transaction
-# ---------------------------------------------------------------------------
-@app.route("/api/delete/<int:txn_id>", methods=["POST"])
-@login_required
-def delete_txn(txn_id):
-    username = session["username"]
-    delete_transaction(username, txn_id)
-    sync_upload_after_change(username)
-    return jsonify({"success": True})
+    credentials = get_all_bank_credentials(username)
+    return render_template(_TPL_SETTINGS, username=username, credentials=credentials)
 
 
-@app.route("/api/update/<int:txn_id>", methods=["POST"])
-@login_required
-def update_txn(txn_id):
-    username = session["username"]
-    data = request.get_json(silent=True) or {}
-    result = update_transaction(username, txn_id, data)
-    if result:
-        sync_upload_after_change(username)
-    return jsonify({"success": result})
-
-
-@app.route("/api/alias", methods=["POST"])
-@login_required
-def save_alias():
-    username = session["username"]
-    data = request.get_json(silent=True) or {}
-    raw_desc = data.get("raw_description", "").strip()
-    display_name = data.get("display_name", "").strip()
-    txn_id = data.get("txn_id")
-
-    if not raw_desc or not display_name:
-        return jsonify({"success": False, "error": "Missing fields"}), 400
-
-    from backend.database import set_merchant_alias
-    set_merchant_alias(username, raw_desc, display_name)
-
-    # Also update the name on the transaction itself
-    if txn_id:
-        update_transaction(username, int(txn_id), {"name": display_name})
-
-    sync_upload_after_change(username)
-    return jsonify({"success": True})
-
-
-# ---------------------------------------------------------------------------
-# Settings & Statement Passwords Manager
-# ---------------------------------------------------------------------------
-@app.route("/settings", methods=["GET"])
+@app.route("/settings", methods=["GET", "POST"])
 @login_required
 def settings():
     username = session["username"]
-    banks = get_all_bank_credentials(username)
-    return render_template(_TPL_SETTINGS, username=username, banks=banks)
 
+    if request.method == "POST":
+        bank_name = request.form.get("bank_name", "").strip()
+        password = request.form.get("password", "").strip()
+        if not bank_name or not password:
+            flash("Please fill in both bank name and password.", "danger")
+        else:
+            encrypted = encrypt_bank_pw(password)
+            add_bank_credential(username, bank_name, encrypted)
+            sync_upload_after_change(username)
+            flash(f"Password for '{bank_name}' saved successfully.", "success")
 
-@app.route("/settings/update-bank-password", methods=["POST"])
-@login_required
-def update_bank_password():
-    username = session["username"]
-
-    bank_name = request.form.get("bank_name", "").strip()
-    password = request.form.get("password", "").strip()
-
-    if not bank_name or not password:
-        flash("Please fill in both bank name and password.", "danger")
-    else:
-        encrypted = encrypt_bank_pw(password)
-        add_bank_credential(username, bank_name, encrypted)
-        sync_upload_after_change(username)
-        flash(f"Password for '{bank_name}' saved successfully.", "success")
-
-    return redirect(url_for("settings"))
+    return redirect(url_for("statement_passwords"))
 
 
 @app.route("/api/bank-password/<int:bank_id>", methods=["POST"])
